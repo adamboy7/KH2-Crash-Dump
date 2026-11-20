@@ -35,7 +35,7 @@
 #include "lua.h"
 #include "lauxlib.h"
 
-#define VERSION 1
+#define VERSION 2
 
 typedef unsigned long long u64;
 typedef BOOL (WINAPI *MiniDumpWriteDump_t)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
@@ -48,11 +48,85 @@ static char g_prefix[MAX_PATH];
 static int g_full, g_keep = 5;
 static MiniDumpWriteDump_t g_mdwd;
 static HANDLE g_go, g_done;
-static PEXCEPTION_POINTERS g_ep;
+static PEXCEPTION_POINTERS g_ep, g_crash_ep;   /* g_ep = the cause (see find_cause) */
 static DWORD g_tid;
 static u64 g_stack_top;
 static volatile LONG g_fired;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev;
+
+/* ---- first-chance recorder ---------------------------------------------------------
+ * KH2's exe loads the .NET runtime (it imports mscoree.dll). When the game crashes, the
+ * runtime's exception handling can overflow the stack, and that second exception is the
+ * one the unhandled filter sees (2026-11-20: a null write at KH2+0x4B00DA arrived as a
+ * stack overflow in clr.dll). So a vectored handler keeps a copy of the recent serious
+ * exceptions (no file work, no stack use worth mentioning) and the filter reports the first
+ * of a run of them on the crashing thread as the cause, and gives that one to the dump.
+ * An earlier exception only counts if it is still being dispatched: its CONTEXT, which
+ * Windows keeps on the stack during dispatch, is still above the crash and unchanged. One
+ * that was caught has been unwound, and its stack space reused or left behind. */
+#define REC_N 8
+typedef struct { DWORD tid; ULONGLONG tick; CONTEXT *live; EXCEPTION_RECORD er; CONTEXT ctx; } Rec;
+static Rec g_rec[REC_N];
+static volatile LONG g_rec_next;
+static EXCEPTION_RECORD g_cause_er;
+static CONTEXT g_cause_ctx;
+static EXCEPTION_POINTERS g_cause_ep;
+static int g_cause_n;   /* exceptions in the run (1 = the crash was the first) */
+static u64 g_stack_top_now;
+
+static int serious(DWORD c) {
+    return c == EXCEPTION_ACCESS_VIOLATION || c == EXCEPTION_STACK_OVERFLOW || c == EXCEPTION_ILLEGAL_INSTRUCTION ||
+           c == EXCEPTION_INT_DIVIDE_BY_ZERO || c == EXCEPTION_PRIV_INSTRUCTION || c == 0xC0000374 || c == 0xC0000409;
+}
+
+static LONG CALLBACK recorder(PEXCEPTION_POINTERS ep) {
+    if (!serious(ep->ExceptionRecord->ExceptionCode) || g_fired) return EXCEPTION_CONTINUE_SEARCH;
+    LONG i = InterlockedIncrement(&g_rec_next) - 1;
+    Rec *r = &g_rec[i % REC_N];
+    r->tid = 0;
+    r->er = *ep->ExceptionRecord;
+    r->er.ExceptionRecord = NULL;
+    r->ctx = *ep->ContextRecord;
+    r->live = ep->ContextRecord;   /* on the stack while the exception is being dispatched */
+    r->tick = GetTickCount64();
+    r->tid = GetCurrentThreadId();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* the oldest of the run of serious exceptions on this thread that ends with the crash:
+ * each one within 2 s of the next, the crash itself included */
+static void find_cause(PEXCEPTION_POINTERS ep) {
+    g_cause_n = 1;
+    g_cause_ep = *ep;
+    DWORD tid = GetCurrentThreadId();
+    ULONGLONG t = GetTickCount64();
+    LONG last = g_rec_next;
+    Rec *pick = NULL;
+    for (LONG k = last - 1; k >= 0 && k >= last - REC_N; k--) {
+        Rec *r = &g_rec[k % REC_N];
+        if (r->tid != tid) continue;
+        if (t - r->tick > 2000) break;
+        t = r->tick;
+        int is_crash = r->er.ExceptionAddress == ep->ExceptionRecord->ExceptionAddress &&
+                       r->er.ExceptionCode == ep->ExceptionRecord->ExceptionCode;
+        if (!is_crash) {
+            CONTEXT *lv = r->live;
+            if ((u64)lv <= ep->ContextRecord->Rsp || (u64)lv >= g_stack_top_now) break;
+            if (lv->Rip != r->ctx.Rip || lv->Rsp != r->ctx.Rsp || lv->Rbx != r->ctx.Rbx ||
+                lv->Rbp != r->ctx.Rbp || lv->Rsi != r->ctx.Rsi || lv->Rdi != r->ctx.Rdi) break;
+        }
+        if (r->er.ExceptionAddress == ep->ExceptionRecord->ExceptionAddress &&
+            r->er.ExceptionCode == ep->ExceptionRecord->ExceptionCode && !pick) continue;   /* the crash itself */
+        pick = r;
+        g_cause_n++;
+    }
+    if (pick) {
+        g_cause_er = pick->er;
+        g_cause_ctx = pick->ctx;
+        g_cause_ep.ExceptionRecord = &g_cause_er;
+        g_cause_ep.ContextRecord = &g_cause_ctx;
+    }
+}
 
 static int push_msg(lua_State *L, const char *msg) { lua_pushnil(L); lua_pushstring(L, msg); return 2; }
 
@@ -105,6 +179,19 @@ static void write_record(const char *dump_result) {
              t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, code_name(er->ExceptionCode),
              (unsigned long)er->ExceptionCode, ip, mod, hm ? ip - (u64)hm : 0ULL, (unsigned long)g_tid);
     note(b);
+    if (g_crash_ep && g_crash_ep->ExceptionRecord != er && g_crash_ep->ExceptionRecord->ExceptionAddress != er->ExceptionAddress) {
+        u64 ip2 = (u64)g_crash_ep->ExceptionRecord->ExceptionAddress;
+        HMODULE h2 = NULL;
+        char m2[MAX_PATH] = "?", full2[MAX_PATH];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)ip2, &h2) && h2 && GetModuleFileNameA(h2, full2, sizeof full2)) {
+            const char *sl = strrchr(full2, '\\'); strncpy(m2, sl ? sl + 1 : full2, sizeof m2 - 1);
+        }
+        snprintf(b, sizeof b, "  then, while that was being handled: %s (0x%08lX) at %s+%llX (%d exceptions in all)\r\n",
+                 code_name(g_crash_ep->ExceptionRecord->ExceptionCode), (unsigned long)g_crash_ep->ExceptionRecord->ExceptionCode,
+                 m2, h2 ? ip2 - (u64)h2 : 0ULL, g_cause_n);
+        note(b);
+    }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
         const char *k = er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 1 ? "write" : "execute";
         snprintf(b, sizeof b, "  %s of address %llX\r\n", k, (u64)er->ExceptionInformation[1]);
@@ -196,7 +283,10 @@ static DWORD WINAPI dump_thread(LPVOID unused) {
 static LONG WINAPI crash_filter(PEXCEPTION_POINTERS ep) {
     /* runs on the crashing thread, perhaps with almost no stack left: hand over and wait */
     if (InterlockedIncrement(&g_fired) == 1) {
-        g_ep = ep;
+        g_stack_top_now = (u64)((NT_TIB *)NtCurrentTeb())->StackBase;
+        find_cause(ep);
+        g_crash_ep = ep;
+        g_ep = &g_cause_ep;
         g_tid = GetCurrentThreadId();
         g_stack_top = (u64)((NT_TIB *)NtCurrentTeb())->StackBase;
         SetEvent(g_go);
@@ -237,6 +327,8 @@ static int l_arm(lua_State *L) {
         CloseHandle(th);
         g_go = go;
     }
+    static int rec_on = 0;
+    if (!rec_on) rec_on = AddVectoredExceptionHandler(1, recorder) != NULL;
     set_filter();
     lua_pushstring(L, g_prefix);
     return 1;
