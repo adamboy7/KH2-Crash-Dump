@@ -1,0 +1,14 @@
+title: KH2 Crash Dump
+originalAuthor: adamboy7
+description: When the game crashes, writes a crash dump (KH2Crash-<date>-<time>.dmp) and a crash log (KH2Crash.log) to the game's install folder, for finding out what crashed. Keeps the last 5 dumps.
+assets:
+- name: scripts/KH2CrashDump.lua
+  platform: pc
+  method: copy
+  source:
+  - name: KH2CrashDump.lua
+- name: scripts/io_packages/kh2crashdump.dll
+  platform: pc
+  method: copy
+  source:
+  - name: io_packages/kh2crashdump.dll
