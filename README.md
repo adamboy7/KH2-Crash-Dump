@@ -19,8 +19,8 @@ Both go in the game's install folder, next to `KINGDOM HEARTS II FINAL MIX.exe`:
   offsets found on the stack (mostly the functions that led to the crash).
 - **`KH2Crash-<date>-<time>.dmp`**: a Windows minidump. Open it in WinDbg or Visual
   Studio, or read it with Python's `minidump` package. It holds every thread's stack and
-  the game's own data sections (KH2 keeps its work memory and heaps there), usually
-  100-200 MB. The last 5 are kept; older ones are deleted when a new one is written.
+  the game's own data section (36 MB in KH2, which keeps its work memory and heaps there),
+  so expect a few tens of MB or more per dump. The last 5 are kept; older ones are deleted when a new one is written.
 
 ## Settings
 
